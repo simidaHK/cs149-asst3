@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -14,6 +15,16 @@
 
 #define THREADS_PER_BLOCK 256
 
+#define CUDA_CHECK(call)                                                     \
+    do {                                                                     \
+        cudaError_t error = (call);                                          \
+        if (error != cudaSuccess) {                                          \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                   \
+                    __FILE__, __LINE__, cudaGetErrorString(error));           \
+            exit(EXIT_FAILURE);                                              \
+        }                                                                    \
+    } while (0)
+
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -25,6 +36,27 @@ static inline int nextPow2(int n) {
     n |= n >> 16;
     n++;
     return n;
+}
+
+__global__ void kernel_exclusive_scan_up_sweep(int* input, int N, int* result, int two_d) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_d_plus_1 = two_d * 2;
+    int active_threads = N / two_d_plus_1;
+    if (index < active_threads) {
+        int k = index * two_d_plus_1;
+        result[k + two_d_plus_1 - 1] += result[k + two_d - 1];
+    }
+}
+__global__ void kernel_exclusive_scan_down_sweep(int* input, int N, int* result, int two_d) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_d_plus_1 = two_d * 2;
+    int active_threads = N / two_d_plus_1;
+    if (index < active_threads) {
+        int k = index * two_d_plus_1;
+        int t = result[k + two_d - 1];
+        result[k + two_d - 1] = result[k + two_d_plus_1 - 1];
+        result[k + two_d_plus_1 - 1] += t;
+    }
 }
 
 // exclusive_scan --
@@ -53,8 +85,18 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
-
-
+    int rounded_length = nextPow2(N);
+    for(int two_d = 1; two_d < rounded_length/2; two_d *= 2) {
+        int two_d_plus_1 = two_d * 2;
+        int threads = (rounded_length + two_d_plus_1 - 1) / two_d_plus_1;
+        kernel_exclusive_scan_up_sweep<<<(threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(input, rounded_length, result, two_d);
+    }
+    CUDA_CHECK(cudaMemset(result + rounded_length - 1, 0, sizeof(int)));
+    for(int two_d = rounded_length/2, threads = 1; two_d >= 1; two_d /= 2, threads *= 2) {
+        int two_d_plus_1 = two_d * 2;
+        kernel_exclusive_scan_down_sweep<<<(threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(input, rounded_length, result, two_d);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 
@@ -82,26 +124,32 @@ double cudaScan(int* inarray, int* end, int* resultarray)
 
     int rounded_length = nextPow2(end - inarray);
     
-    cudaMalloc((void **)&device_result, sizeof(int) * rounded_length);
-    cudaMalloc((void **)&device_input, sizeof(int) * rounded_length);
+    CUDA_CHECK(cudaMalloc((void **)&device_result, sizeof(int) * rounded_length));
+    CUDA_CHECK(cudaMalloc((void **)&device_input, sizeof(int) * rounded_length));
 
     // For convenience, both the input and output vectors on the
     // device are initialized to the input values. This means that
     // students are free to implement an in-place scan on the result
     // vector if desired.  If you do this, you will need to keep this
     // in mind when calling exclusive_scan from find_repeats.
-    cudaMemcpy(device_input, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(device_input, inarray, (end - inarray) * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_result, inarray, (end - inarray) * sizeof(int),
+                          cudaMemcpyHostToDevice));
 
     double startTime = CycleTimer::currentSeconds();
 
     exclusive_scan(device_input, N, device_result);
 
     // Wait for completion
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     double endTime = CycleTimer::currentSeconds();
        
-    cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(resultarray, device_result,
+                          (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(device_input));
+    CUDA_CHECK(cudaFree(device_result));
 
     double overallDuration = endTime - startTime;
     return overallDuration; 
@@ -140,6 +188,23 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void kernel_find_repeats(int* device_input, int length, int* device_output) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length) {
+        device_output[index] =
+            (index < length - 1 && device_input[index] == device_input[index + 1])
+            ? 1
+            : 0;
+    }
+}
+
+__global__ void kernel_write_repeats(int* device_input, int length, int* device_output, int* device_scan) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length - 1 && device_input[index] == device_input[index + 1]) {
+        int output_index = device_scan[index];
+        device_output[output_index] = index;
+    }
+}
 
 // find_repeats --
 //
@@ -160,8 +225,29 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    if(length < 2) {
+        return 0;
+    }
 
-    return 0; 
+    int* repeats_index;
+    int rounded_length = nextPow2(length);
+    CUDA_CHECK(cudaMalloc((void **)&repeats_index,
+                          rounded_length * sizeof(int)));
+
+    int threads = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    kernel_find_repeats<<<threads, THREADS_PER_BLOCK>>>(device_input, length, repeats_index);
+    exclusive_scan(repeats_index, length, repeats_index);
+    kernel_write_repeats<<<threads, THREADS_PER_BLOCK>>>(device_input, length, device_output, repeats_index);
+    CUDA_CHECK(cudaGetLastError());
+
+    int result;
+    CUDA_CHECK(cudaMemcpy(&result,
+                          repeats_index + length - 1,
+                          sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(repeats_index));
+
+    return result;
 }
 
 
@@ -175,24 +261,28 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
     int *device_output;
     int rounded_length = nextPow2(length);
     
-    cudaMalloc((void **)&device_input, rounded_length * sizeof(int));
-    cudaMalloc((void **)&device_output, rounded_length * sizeof(int));
-    cudaMemcpy(device_input, input, length * sizeof(int), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc((void **)&device_input,
+                          rounded_length * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void **)&device_output,
+                          rounded_length * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(device_input, input, length * sizeof(int),
+                          cudaMemcpyHostToDevice));
 
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     double startTime = CycleTimer::currentSeconds();
     
     int result = find_repeats(device_input, length, device_output);
 
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     double endTime = CycleTimer::currentSeconds();
 
     // set output count and results array
     *output_length = result;
-    cudaMemcpy(output, device_output, length * sizeof(int), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(output, device_output, length * sizeof(int),
+                          cudaMemcpyDeviceToHost));
 
-    cudaFree(device_input);
-    cudaFree(device_output);
+    CUDA_CHECK(cudaFree(device_input));
+    CUDA_CHECK(cudaFree(device_output));
 
     float duration = endTime - startTime; 
     return duration;
