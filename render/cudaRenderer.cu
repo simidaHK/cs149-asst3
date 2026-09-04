@@ -13,6 +13,10 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "circleBoxTest.cu_inl"
+#define SCAN_BLOCK_DIM   256  // needed by sharedMemExclusiveScan implementation
+#define BATCH_SIZE 256
+#include "exclusiveScan.cu_inl"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -312,19 +316,20 @@ __global__ void kernelAdvanceSnowflake() {
     *((float3*)velocityPtr) = velocity;
 }
 
-// shadePixel -- (CUDA device code)
+// shadePixelLocal -- (CUDA device code)
 //
 // given a pixel and a circle, determines the contribution to the
-// pixel from the circle.  Update of the image is done in this
-// function.  Called by kernelRenderCircles()
+// pixel from the circle. The pixel color is kept in a local accumulator
+// so a pixel-parallel renderer only needs one global-memory write.
+template <bool isSnowScene>
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixelLocal(int circleIndex, float2 pixelCenter, float3 p, float4& pixelColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = cuConstRendererParams.radius[circleIndex];
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -342,7 +347,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // would be wise to perform this logic outside of the loop next in
     // kernelRenderCircles.  (If feeling good about yourself, you
     // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    if (isSnowScene) {
 
         const float kCircleMaxAlpha = .5f;
         const float falloffScale = 4.f;
@@ -363,20 +368,23 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float oneMinusAlpha = 1.f - alpha;
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
+    pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+    pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+    pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+    pixelColor.w = alpha + pixelColor.w;
+}
 
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
-
-    // global memory write
-    *imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
+// Retain the original global-memory interface for the starter renderer.
+__device__ __inline__ void
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+    float4 pixelColor = *imagePtr;
+    if (cuConstRendererParams.sceneName == SNOWFLAKES ||
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        shadePixelLocal<true>(circleIndex, pixelCenter, p, pixelColor);
+    } else {
+        shadePixelLocal<false>(circleIndex, pixelCenter, p, pixelColor);
+    }
+    *imagePtr = pixelColor;
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -427,6 +435,100 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+
+template <bool isSnowScene>
+__global__ void kernelRender() {
+    int linearThreadIdx = threadIdx.x + blockDim.x * threadIdx.y;
+    int batchSize = blockDim.x * blockDim.y;
+
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    int tileLeft = blockIdx.x * blockDim.x;
+    int tileBottom = blockIdx.y * blockDim.y;
+    int tileRight = min(tileLeft + blockDim.x, imageWidth);
+    int tileTop = min(tileBottom + blockDim.y, imageHeight);
+
+    int pixelX = tileLeft + threadIdx.x;
+    int pixelY = tileBottom + threadIdx.y;
+
+    bool pixelValid = pixelX < imageWidth && pixelY < imageHeight;
+    float2 pixelCenter = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float4* imagePtr = nullptr;
+    float4 pixelColor = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (pixelValid) {
+        imagePtr = (float4*)&cuConstRendererParams.imageData[
+            4 * (pixelY * imageWidth + pixelX)];
+        pixelColor = *imagePtr;
+    }
+
+    __shared__ uint circleFlag[BATCH_SIZE];
+    __shared__ uint circleOffset[BATCH_SIZE];
+    __shared__ uint prefixSumScratch[2 * BATCH_SIZE];
+    __shared__ uint circleList[BATCH_SIZE];
+    __shared__ uint validCircleCount;
+
+    for (int batchStart = 0;
+         batchStart < cuConstRendererParams.numCircles;
+         batchStart += batchSize) {
+        int circleIndex = batchStart + linearThreadIdx;
+        bool circleValid = circleIndex < cuConstRendererParams.numCircles;
+        circleFlag[linearThreadIdx] = 0;
+
+        if (circleValid) {
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+
+            if (circleInBoxConservative(
+                    p.x, p.y, rad,
+                    invWidth * tileLeft, invWidth * tileRight,
+                    invHeight * tileTop, invHeight * tileBottom)) {
+                if (circleInBox(
+                        p.x, p.y, rad,
+                        invWidth * tileLeft, invWidth * tileRight,
+                        invHeight * tileTop, invHeight * tileBottom)) {
+                    circleFlag[linearThreadIdx] = 1;
+                }
+            }
+        }
+
+        __syncthreads();
+        sharedMemExclusiveScan(linearThreadIdx, circleFlag, circleOffset, prefixSumScratch, batchSize);
+
+        if (circleFlag[linearThreadIdx]) {
+            circleList[circleOffset[linearThreadIdx]] = circleIndex;
+        }
+
+        if (linearThreadIdx == batchSize - 1) {
+            validCircleCount = circleOffset[linearThreadIdx] + circleFlag[linearThreadIdx];
+        }
+        __syncthreads();
+
+        if (pixelValid) {
+            for (uint i = 0; i < validCircleCount; i++) {
+                int candidateIndex = circleList[i];
+                int candidateIndex3 = 3 * candidateIndex;
+                float3 p = *(float3*)(&cuConstRendererParams.position[candidateIndex3]);
+                shadePixelLocal<isSnowScene>(
+                    candidateIndex, pixelCenter, p, pixelColor);
+            }
+        }
+
+        // No thread may overwrite the shared candidate list for the next
+        // batch until every pixel thread has finished consuming this batch.
+        __syncthreads();
+    }
+
+    if (pixelValid) {
+        *imagePtr = pixelColor;
+    }
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -637,9 +739,13 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(16, 16);
+    dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelRender<true><<<gridDim, blockDim>>>();
+    } else {
+        kernelRender<false><<<gridDim, blockDim>>>();
+    }
     cudaDeviceSynchronize();
 }
